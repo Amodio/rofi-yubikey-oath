@@ -723,6 +723,7 @@ Mode mode = {
     .abi_version        = ABI_VERSION,
     .name               = "yubikey-oath",
     .cfg_name_key       = "display-yubikey-oath",
+    .type               = MODE_TYPE_SWITCHER,
     ._init              = myplugin_mode_init,
     ._get_num_entries   = myplugin_mode_get_num_entries,
     ._result            = myplugin_mode_result,
