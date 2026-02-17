@@ -21,17 +21,25 @@ Wayland clipboard via `wl-copy`.
 ```sh
 # Alpine Linux
 sudo apk add meson rofi-dev glib-dev pcsclite-dev ccid wl-clipboard
+sudo rc-update add pcscd default
 
 # Debian / Ubuntu (untested)
 sudo apt install meson rofi-dev libglib2.0-dev libpcsclite-dev wl-clipboard pcscd
 ```
 
+Make sure pcscd is running and you have the rights:
+
+```sh
+service pcscd status
+sudo usermod -a -G plugdev,pcscd $USER
+```
+
 ## Build & install
 
 ```sh
-meson setup build
-meson compile -C build
-sudo meson install -C build
+meson setup build/
+#meson compile -C build/
+sudo meson install -C build/
 ```
 
 ## Usage
@@ -53,5 +61,5 @@ bindsym $mod+y exec rofi -modi yubikey-oath -show yubikey-oath
 - HOTP credentials are treated as touch-required (tag `0x77`).
 - The plugin keeps the PC/SC connection open for the duration of the rofi
   session and closes it cleanly on exit.
-- For X11 sessions substitute `xclip -selection clipboard` for `wl-copy`
-  by editing `copy_to_clipboard()` in `src/yubikey-oath.c`.
+- For X11 sessions compatibility, one could substitute `wl-copy` for
+`xclip -selection clipboard` by editing `copy_to_clipboard()`.

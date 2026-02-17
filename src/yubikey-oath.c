@@ -51,7 +51,7 @@
 
 #define INS_SELECT        0xA4
 #define INS_CALCULATE     0xA2
-#define INS_CALCULATE_ALL 0xA4   /* same opcode; CLA/P1/P2 differ from SELECT */
+#define INS_CALCULATE_ALL 0xA4  /* same opcode; CLA/P1/P2 differ from SELECT */
 
 #define RESPONSE_BUF_SIZE 8192
 
@@ -86,8 +86,8 @@ parse_tlv(const unsigned char *data, size_t data_len, TLV *tlv)
 #define ENTRY_CODE_MAX  16
 
 typedef struct {
-    char name[ENTRY_NAME_MAX];   /* raw credential name as returned by YubiKey  */
-    int  needs_touch;            /* 1 → requires physical touch on CALCULATE    */
+    char name[ENTRY_NAME_MAX]; /* raw credential name as returned by YubiKey */
+    int  needs_touch;          /* 1 → requires physical touch on CALCULATE   */
 } OATHEntry;
 
 /* ── Plugin private data ────────────────────────────────────────────────── */
@@ -106,6 +106,24 @@ typedef struct {
 
     /* Display strings: "🔒 Issuer  <i>login</i>" (Pango markup, MARKUP_ROWS) */
     char       **display;
+
+    /*
+     * Touch flow:
+     *
+     *   _result sets awaiting_touch = 1 and schedules on_touch_idle()
+     *   via g_idle_add(), then returns RELOAD_DIALOG.
+     *
+     *   rofi redraws: _get_num_entries returns 1, _get_display_value
+     *   returns the prompt — the user sees "👆 Touch your YubiKey…".
+     *
+     *   on_touch_idle() fires on the next idle iteration (after the
+     *   redraw), blocks on CALCULATE, copies the code, then calls
+     *   exit(0) to close rofi cleanly.
+     *
+     *   pending_touch_name holds the credential name for the idle cb.
+     */
+    int  awaiting_touch;
+    char pending_touch_name[ENTRY_NAME_MAX];
 } YKOATHPrivateData;
 
 G_MODULE_EXPORT Mode mode;
@@ -141,7 +159,8 @@ send_apdu(SCARDHANDLE card, DWORD protocol,
 
     rv = SCardBeginTransaction(card);
     if (rv != SCARD_S_SUCCESS)
-        fprintf(stderr, "[yubikey-oath] SCardBeginTransaction: %s (continuing)\n",
+        fprintf(stderr,
+                "[yubikey-oath] SCardBeginTransaction: %s (continuing)\n",
                 pcsc_stringify_error(rv));
 
     rv = SCardTransmit(card, &pioSendPci,
@@ -215,7 +234,7 @@ select_oath_app(SCARDHANDLE card, DWORD protocol)
     apdu[4] = OATH_AID_LEN;
     memcpy(apdu + 5, OATH_AID, OATH_AID_LEN);
 
-    if (send_apdu(card, protocol, apdu, sizeof(apdu), response, &response_len) != 0)
+    if (send_apdu(card, protocol, apdu, sizeof(apdu), response, &response_len))
         return -1;
 
     if (response_len < 2 ||
@@ -249,7 +268,6 @@ build_display(const char *name, int needs_touch)
     char *issuer_esc, *login_esc, *result;
 
     if (colon) {
-        /* Split on the first colon */
         char *issuer = g_strndup(name, (gsize)(colon - name));
         issuer_esc   = g_markup_escape_text(issuer, -1);
         login_esc    = g_markup_escape_text(colon + 1, -1);
@@ -278,8 +296,7 @@ build_display(const char *name, int needs_touch)
  * Run LIST (via CALCULATE ALL with a dummy challenge) to enumerate credential
  * names, then populate pd->entries / pd->display.
  *
- * Codes are never computed here — they are requested on demand when the user
- * selects an entry.  Must be called after select_oath_app().
+ * Must be called after select_oath_app().
  */
 static void
 load_entries(YKOATHPrivateData *pd)
@@ -288,12 +305,6 @@ load_entries(YKOATHPrivateData *pd)
     unsigned char response[RESPONSE_BUF_SIZE];
     size_t response_len = sizeof(response);
 
-    /*
-     * We still use CALCULATE ALL so the card tells us which credentials
-     * require touch (tag 0x77 / 0x7C) vs which ones it would compute
-     * directly (tag 0x76).  A zero challenge is fine — we discard the
-     * codes immediately.
-     */
     unsigned char challenge[8] = { 0 };
 
     size_t apdu_len = 0;
@@ -318,44 +329,49 @@ load_entries(YKOATHPrivateData *pd)
 
     /* 90 00 = complete, 61 XX = more data (already fetched by send_apdu) */
     if (sw1 != 0x90 && sw1 != 0x61) {
-        fprintf(stderr,
-                "[yubikey-oath] CALCULATE ALL failed: %02X%02X\n", sw1, sw2);
+        fprintf(stderr, "[yubikey-oath] CALCULATE ALL failed: %02X%02X\n",
+                sw1, sw2);
         return;
     }
 
-    /* First pass: count entries so we allocate exactly */
+    /* First pass: count entries */
     unsigned int count = 0;
     size_t pos = 0;
+
     while (pos < response_len - 2) {
         TLV name_tlv, code_tlv;
         int c = parse_tlv(response + pos, response_len - 2 - pos, &name_tlv);
-        if (c < 0 || name_tlv.tag != 0x71) break;
+        if (c < 0 || name_tlv.tag != 0x71)
+            break;
         pos += c;
         c = parse_tlv(response + pos, response_len - 2 - pos, &code_tlv);
-        if (c < 0) break;
+        if (c < 0)
+            break;
         pos += c;
         count++;
     }
-    if (count == 0) return;
+    if (count == 0)
+        return;
 
     pd->entries     = g_malloc0(count * sizeof(OATHEntry));
     pd->display     = g_malloc0(count * sizeof(char *));
     pd->entry_count = 0;
 
-    /* Second pass: fill entries (name + touch flag only, no codes) */
+    /* Second pass: fill entries */
     pos = 0;
     while (pos < response_len - 2 && pd->entry_count < count) {
         TLV name_tlv, code_tlv;
         int c = parse_tlv(response + pos, response_len - 2 - pos, &name_tlv);
-        if (c < 0 || name_tlv.tag != 0x71) break;
+        if (c < 0 || name_tlv.tag != 0x71)
+            break;
         pos += c;
         c = parse_tlv(response + pos, response_len - 2 - pos, &code_tlv);
-        if (c < 0) break;
+        if (c < 0)
+            break;
         pos += c;
 
         OATHEntry *e = &pd->entries[pd->entry_count];
 
-        /* Copy raw credential name (NUL-terminated) */
         size_t nlen = name_tlv.length < ENTRY_NAME_MAX - 1
                       ? name_tlv.length : ENTRY_NAME_MAX - 1;
         memcpy(e->name, name_tlv.value, nlen);
@@ -376,8 +392,8 @@ load_entries(YKOATHPrivateData *pd)
 
 /**
  * Calculate TOTP for a single credential by name.
- * Used when the user selects a touch-required entry.
  * Returns a g_malloc'd string the caller must g_free(), or NULL on error.
+ * For touch-required credentials this call blocks until the key is touched.
  */
 static char *
 calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
@@ -388,6 +404,7 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
 
     uint64_t timestamp = (uint64_t)time(NULL) / 30;
     unsigned char challenge[8];
+
     for (int i = 7; i >= 0; i--) {
         challenge[i] = timestamp & 0xFF;
         timestamp >>= 8;
@@ -399,9 +416,9 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
     apdu[apdu_len++] = 0x00;
     apdu[apdu_len++] = INS_CALCULATE;
     apdu[apdu_len++] = 0x00;
-    apdu[apdu_len++] = 0x01;             /* request full (truncated) response */
-    apdu[apdu_len++] = 0;               /* Lc placeholder                     */
-    apdu[apdu_len++] = 0x71;            /* Name tag                           */
+    apdu[apdu_len++] = 0x01;            /* request full (truncated) response */
+    apdu[apdu_len++] = 0;               /* Lc placeholder                    */
+    apdu[apdu_len++] = 0x71;            /* Name tag                          */
     apdu[apdu_len++] = (unsigned char)name_len;
     memcpy(apdu + apdu_len, credential_name, name_len);
     apdu_len += name_len;
@@ -418,8 +435,7 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
     if (response_len < 2 ||
         response[response_len - 2] != 0x90 ||
         response[response_len - 1] != 0x00) {
-        fprintf(stderr,
-                "[yubikey-oath] CALCULATE failed for '%s': %02X%02X\n",
+        fprintf(stderr, "[yubikey-oath] CALCULATE failed for '%s': %02X%02X\n",
                 credential_name,
                 response[response_len - 2], response[response_len - 1]);
         return NULL;
@@ -458,6 +474,36 @@ copy_to_clipboard(const char *text)
         fprintf(pipe, "%s", text);
         pclose(pipe);
     }
+}
+
+/* ── Touch idle callback ────────────────────────────────────────────────── */
+
+/*
+ * Fired by GLib on the first idle iteration after _result returns
+ * RELOAD_DIALOG.  By this point rofi has redrawn and the "👆 Touch your
+ * YubiKey…" prompt is on screen.  We block here on the CALCULATE APDU,
+ * copy the resulting code to the clipboard, then exit the process cleanly.
+ *
+ * Using exit() rather than a rofi API is intentional: there is no public
+ * symbol that closes rofi from outside its _result callback, and calling
+ * exit() from a GLib idle source is well-defined — atexit handlers and
+ * GLib cleanup both run normally.
+ */
+static gboolean
+on_touch_idle(gpointer user_data)
+{
+    YKOATHPrivateData *pd = (YKOATHPrivateData *)user_data;
+
+    select_oath_app(pd->card, pd->protocol);
+    char *code = calculate_single_totp(pd, pd->pending_touch_name);
+
+    if (code) {
+        copy_to_clipboard(code);
+        g_free(code);
+    }
+
+    exit(0);
+    return G_SOURCE_REMOVE;   /* never reached, but satisfies the type */
 }
 
 /* ── PC/SC initialisation / teardown ───────────────────────────────────── */
@@ -546,7 +592,6 @@ myplugin_mode_init(Mode *sw)
         load_entries(pd);
     } else {
         pd->pcsc_ok = 0;
-        /* Show a single error entry so the user sees something */
         pd->entries     = g_malloc0(sizeof(OATHEntry));
         pd->display     = g_malloc0(sizeof(char *));
         pd->entry_count = 1;
@@ -564,36 +609,55 @@ myplugin_mode_get_num_entries(const Mode *sw)
 {
     const YKOATHPrivateData *pd =
         (const YKOATHPrivateData *)mode_get_private_data(sw);
+    if (pd->awaiting_touch)
+        return 1;
     return pd->entry_count;
 }
 
 static ModeMode
-myplugin_mode_result(Mode *sw, int mretv,
-                     G_GNUC_UNUSED char **input,
+myplugin_mode_result(Mode *sw, int mretv, G_GNUC_UNUSED char **input,
                      unsigned int selected_line)
 {
     YKOATHPrivateData *pd = (YKOATHPrivateData *)mode_get_private_data(sw);
 
-    if (mretv & MENU_NEXT)         return NEXT_DIALOG;
-    if (mretv & MENU_PREVIOUS)     return PREVIOUS_DIALOG;
-    if (mretv & MENU_QUICK_SWITCH) return (ModeMode)(mretv & MENU_LOWER_MASK);
+    if (mretv & MENU_NEXT)
+        return NEXT_DIALOG;
+    if (mretv & MENU_PREVIOUS)
+        return PREVIOUS_DIALOG;
+    if (mretv & MENU_QUICK_SWITCH)
+        return (ModeMode)(mretv & MENU_LOWER_MASK);
 
-    if ((mretv & MENU_OK) && pd->pcsc_ok &&
-        selected_line < pd->entry_count) {
+    if ((mretv & MENU_OK) && pd->pcsc_ok && selected_line < pd->entry_count) {
+
         OATHEntry *e = &pd->entries[selected_line];
 
-        /*
-         * Always request a fresh code — we never cache them in the list.
-         * Re-select the OATH app first in case the card session has idled.
-         * For touch-required credentials the key will block until touched.
-         */
-        select_oath_app(pd->card, pd->protocol);
-        char *code = calculate_single_totp(pd, e->name);
-        if (code) {
-            copy_to_clipboard(code);
-            g_free(code);
+        if (!e->needs_touch) {
+            /* No touch needed: calculate and exit */
+            select_oath_app(pd->card, pd->protocol);
+            char *code = calculate_single_totp(pd, e->name);
+            if (code) {
+                copy_to_clipboard(code);
+                g_free(code);
+            }
+            return MODE_EXIT;
         }
-        return MODE_EXIT;
+
+        /*
+         * Touch required:
+         *
+         * 1. Set awaiting_touch so the next redraw shows the prompt.
+         * 2. Schedule on_touch_idle() to run after rofi has redrawn.
+         * 3. Return RELOAD_DIALOG — rofi redraws (prompt visible), then
+         *    the GLib main loop picks up the idle source and calls
+         *    on_touch_idle(), which blocks on CALCULATE and exits.
+         */
+        pd->awaiting_touch = 1;
+        strncpy(pd->pending_touch_name, e->name, ENTRY_NAME_MAX - 1);
+        pd->pending_touch_name[ENTRY_NAME_MAX - 1] = '\0';
+
+        g_idle_add(on_touch_idle, pd);
+
+        return RELOAD_DIALOG;
     }
 
     if (mretv & MENU_ENTRY_DELETE)
@@ -632,8 +696,12 @@ _get_display_value(const Mode *sw, unsigned int selected_line,
     if (state)
         *state |= MARKUP_ROWS;
 
-    if (!get_entry) return NULL;
-    if (selected_line >= pd->entry_count) return g_strdup("n/a");
+    if (!get_entry)
+        return NULL;
+    if (pd->awaiting_touch)
+        return g_strdup("👆 Touch your YubiKey…");
+    if (selected_line >= pd->entry_count)
+        return g_strdup("n/a");
     return g_strdup(pd->display[selected_line]);
 }
 
@@ -644,11 +712,8 @@ myplugin_token_match(const Mode *sw, rofi_int_matcher **tokens,
     const YKOATHPrivateData *pd =
         (const YKOATHPrivateData *)mode_get_private_data(sw);
 
-    if (index >= pd->entry_count) return 0;
-    /*
-     * Match against the raw credential name (e.g. "GitHub:alice"), not the
-     * Pango-markup display string — otherwise "<i>" would appear in searches.
-     */
+    if (index >= pd->entry_count)
+        return 0;
     return helper_token_match(tokens, pd->entries[index].name);
 }
 
