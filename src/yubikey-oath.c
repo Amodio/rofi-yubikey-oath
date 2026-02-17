@@ -31,6 +31,10 @@
 #include <rofi/helper.h>
 #include <rofi/mode-private.h>
 
+#ifdef HAVE_FONTCONFIG
+#include <fontconfig/fontconfig.h>
+#endif
+
 /* PC/SC — libpcsclite-dev on Debian/Ubuntu, pcsclite on Arch */
 #include <winscard.h>
 
@@ -114,7 +118,7 @@ typedef struct {
      *   via g_idle_add(), then returns RELOAD_DIALOG.
      *
      *   rofi redraws: _get_num_entries returns 1, _get_display_value
-     *   returns the prompt — the user sees "👆 Touch your YubiKey…".
+     *   returns the prompt — the user sees "👆 Please touch your YubiKey…".
      *
      *   on_touch_idle() fires on the next idle iteration (after the
      *   redraw), blocks on CALCULATE, copies the code, then calls
@@ -127,6 +131,20 @@ typedef struct {
 } YKOATHPrivateData;
 
 G_MODULE_EXPORT Mode mode;
+
+/*
+ * If fontconfig is available, initialise it in a library constructor so
+ * it is ready before any dependency constructor can call into it
+ * implicitly, which would trigger a "using without calling FcInit()"
+ * warning on stderr.
+ */
+#ifdef HAVE_FONTCONFIG
+static void __attribute__((constructor))
+plugin_init_fontconfig(void)
+{
+    FcInit();
+}
+#endif
 
 /* ── PC/SC send/receive ─────────────────────────────────────────────────── */
 
@@ -480,7 +498,7 @@ copy_to_clipboard(const char *text)
 
 /*
  * Fired by GLib on the first idle iteration after _result returns
- * RELOAD_DIALOG.  By this point rofi has redrawn and the "👆 Touch your
+ * RELOAD_DIALOG.  By this point rofi has redrawn and the "👆 Please touch your
  * YubiKey…" prompt is on screen.  We block here on the CALCULATE APDU,
  * copy the resulting code to the clipboard, then exit the process cleanly.
  *
@@ -699,7 +717,7 @@ _get_display_value(const Mode *sw, unsigned int selected_line,
     if (!get_entry)
         return NULL;
     if (pd->awaiting_touch)
-        return g_strdup("👆 Touch your YubiKey…");
+        return g_strdup("👆 Please touch your YubiKey…");
     if (selected_line >= pd->entry_count)
         return g_strdup("n/a");
     return g_strdup(pd->display[selected_line]);
