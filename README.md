@@ -58,8 +58,5 @@ bindsym $mod+y exec rofi -modi yubikey-oath -show yubikey-oath
 
 - Only the **first** PC/SC reader is used. If you have multiple readers,
   the YubiKey must be the first one enumerated by `pcscd`.
-- HOTP credentials are treated as touch-required (tag `0x77`).
-- The plugin keeps the PC/SC connection open for the duration of the rofi
-  session and closes it cleanly on exit.
 - For X11 sessions compatibility, one could substitute `wl-copy` for
 `xclip -selection clipboard` by editing `copy_to_clipboard()`.
