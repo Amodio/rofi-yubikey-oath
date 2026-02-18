@@ -217,6 +217,16 @@ plugin_init_fontconfig(void)
 }
 #endif
 
+/* ── Forward declarations ───────────────────────────────────────────────── */
+/*
+ * Declared here, at the top, so all functions below may call each other
+ * freely without depending on textual order.
+ */
+static int      pcsc_reconnect(YKOATHPrivateData *pd);
+static void     pcsc_disconnect(YKOATHPrivateData *pd);
+static void     pcsc_teardown(YKOATHPrivateData *pd);
+static gboolean on_touch_idle(gpointer user_data);
+
 /* ── PC/SC send/receive ─────────────────────────────────────────────────── */
 
 /**
@@ -421,15 +431,15 @@ load_entries(YKOATHPrivateData *pd)
     YK_LOG("CALCULATE ALL: timestamp=%" PRIu64, (uint64_t)time(NULL) / 30);
 
     size_t apdu_len = 0;
-    apdu[apdu_len++] = 0x00;              /* CLA                    */
-    apdu[apdu_len++] = INS_CALCULATE_ALL; /* INS 0xA4               */
-    apdu[apdu_len++] = 0x00;              /* P1                     */
-    apdu[apdu_len++] = 0x01;              /* P2 = 0x01: full response    */
-    apdu[apdu_len++] = 0x00;             /* Extended APDU marker         */
-    apdu[apdu_len++] = 0x00;             /* Lc high byte                 */
-    apdu[apdu_len++] = 10;               /* Lc low byte (10 bytes)       */
-    apdu[apdu_len++] = 0x74;             /* Challenge tag                */
-    apdu[apdu_len++] = 8;                /* Challenge length             */
+    apdu[apdu_len++] = 0x00;              /* CLA                          */
+    apdu[apdu_len++] = INS_CALCULATE_ALL; /* INS 0xA4                     */
+    apdu[apdu_len++] = 0x00;              /* P1                           */
+    apdu[apdu_len++] = 0x01;              /* P2 = 0x01: full response     */
+    apdu[apdu_len++] = 0x00;              /* Extended APDU marker         */
+    apdu[apdu_len++] = 0x00;              /* Lc high byte                 */
+    apdu[apdu_len++] = 10;                /* Lc low byte (10 bytes)       */
+    apdu[apdu_len++] = 0x74;              /* Challenge tag                */
+    apdu[apdu_len++] = 8;                 /* Challenge length             */
     memcpy(apdu + apdu_len, challenge, 8);
     apdu_len += 8;
     /* No Le field — matches ykman behaviour */
@@ -507,10 +517,6 @@ load_entries(YKOATHPrivateData *pd)
          *     0x77 → HOTP or touch-required TOTP
          *     0x7C → touch-only TOTP (explicit)
          *
-         * We use P2=0x00, so the no-touch tag is 0x75.
-         * Accept 0x76 as well for defensive compatibility.
-         */
-        /*
          * With P2=0x01, the YubiKey computes codes inline for no-touch
          * credentials and returns them with tag 0x76.
          * Touch-required credentials return tag 0x7C.
@@ -537,6 +543,18 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
     unsigned char response[256];
     size_t response_len = sizeof(response);
 
+    size_t name_len = strlen(credential_name);
+
+    /* Guard against a crafted/corrupt credential name overflowing the APDU
+     * buffer: 7 fixed header bytes + name + 2 challenge tag/len + 8 challenge
+     * data = 17 + name_len bytes total. */
+    if (17 + name_len > sizeof(apdu))
+    {
+        fprintf(stderr,
+            "[yubikey-oath] credential name too long (%zu bytes)\n", name_len);
+        return NULL;
+    }
+
     uint64_t timestamp = (uint64_t)time(NULL) / 30;
     unsigned char challenge[8];
 
@@ -549,7 +567,6 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
     YK_LOG("CALCULATE '%s' timestamp=%" PRIu64, credential_name,
            (uint64_t)time(NULL) / 30);
 
-    size_t name_len = strlen(credential_name);
     size_t apdu_len = 0;
     size_t lc_value = 2 + name_len + 2 + 8;  /* name TLV + challenge TLV */
 
@@ -564,8 +581,8 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
     apdu[apdu_len++] = (unsigned char)name_len;
     memcpy(apdu + apdu_len, credential_name, name_len);
     apdu_len += name_len;
-    apdu[apdu_len++] = 0x74;            /* Challenge tag */
-    apdu[apdu_len++] = 8;
+    apdu[apdu_len++] = 0x74;            /* Challenge tag                     */
+    apdu[apdu_len++] = 8;               /* Challenge length                  */
     memcpy(apdu + apdu_len, challenge, 8);
     apdu_len += 8;
     /* No Le field — matches ykman behaviour */
@@ -574,10 +591,9 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
                   response, &response_len) != 0)
         return NULL;
 
-    if (response_len < 2 ||
-        response[response_len - 2] != 0x90 ||
+    if (response_len < 2 || response[response_len - 2] != 0x90 ||
         response[response_len - 1] != 0x00)
-        {
+    {
         fprintf(stderr, "[yubikey-oath] CALCULATE failed for '%s': %02X%02X\n",
                 credential_name,
                 response[response_len - 2], response[response_len - 1]);
@@ -614,21 +630,21 @@ calculate_single_totp(YKOATHPrivateData *pd, const char *credential_name)
     return NULL;
 }
 
-/* ── Forward declarations ───────────────────────────────────────────────── */
-
-static int pcsc_reconnect(YKOATHPrivateData *pd);
-
 /* ── Clipboard helper ───────────────────────────────────────────────────── */
 
 static void
 copy_to_clipboard(const char *text)
 {
     FILE *pipe = popen("wl-copy", "w");
-    if (pipe)
+    if (!pipe)
     {
-        fprintf(pipe, "%s", text);
-        pclose(pipe);
+        fprintf(stderr, "[yubikey-oath] popen(wl-copy) failed: %s\n",
+                strerror(errno));
+        return;
     }
+    if (fprintf(pipe, "%s", text) < 0)
+        fprintf(stderr, "[yubikey-oath] write to wl-copy failed\n");
+    pclose(pipe);
 }
 
 /**
@@ -667,20 +683,23 @@ on_touch_idle(gpointer user_data)
 {
     YKOATHPrivateData *pd = (YKOATHPrivateData *)user_data;
 
-    if (pcsc_reconnect(pd) == 0)
+    if (pcsc_reconnect(pd) != 0)
     {
-        YK_LOG("on_touch_idle: connected, blocking on CALCULATE for '%s'",
-               pd->pending_touch_name);
-        double t0 = yk_now_ms();
-        char *code = calculate_single_totp(pd, pd->pending_touch_name);
-        YK_LOG("on_touch_idle: CALCULATE returned in %.1f ms", yk_now_ms()-t0);
-        pcsc_disconnect(pd);   // immediately drop the channel
-        if (code)
-        {
-            copy_to_clipboard(code);
-            g_free(code);
-        }
-        /* exit(0) follows immediately; pcsc_teardown via atexit is fine */
+        fprintf(stderr,
+                "[yubikey-oath] on_touch_idle: failed to reconnect\n");
+        exit(1);
+    }
+
+    YK_LOG("on_touch_idle: connected, blocking on CALCULATE for '%s'",
+           pd->pending_touch_name);
+    double t0 = yk_now_ms();
+    char *code = calculate_single_totp(pd, pd->pending_touch_name);
+    YK_LOG("on_touch_idle: CALCULATE returned in %.1f ms", yk_now_ms() - t0);
+    pcsc_disconnect(pd);
+    if (code)
+    {
+        copy_to_clipboard(code);
+        g_free(code);
     }
 
     exit(0);
