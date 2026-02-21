@@ -1,7 +1,7 @@
 project(
   'rofi-yubikey-oath',
   'c',
-  version : '1.1.0',
+  version : '1.2.0',
   default_options : [
     'warning_level=3', # enables -Wall -Wextra
 #    'werror=true',
@@ -37,7 +37,7 @@ add_project_arguments([
   '-Wparentheses',
   '-Winline',
   '-pedantic',
-  '-Wunreachable-code'
+  '-Wunreachable-code',
 ], language : 'c')
 # -------------------------------------------------
 # Build plugin module
