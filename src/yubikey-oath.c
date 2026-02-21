@@ -964,6 +964,16 @@ myplugin_token_match(const Mode *sw, rofi_int_matcher **tokens,
     const YKOATHPrivateData *pd =
         (const YKOATHPrivateData *)mode_get_private_data(sw);
 
+    /*
+     * While we are waiting for a YubiKey touch, _get_num_entries returns 1
+     * and _get_display_value returns the "👆 Please touch your YubiKey…"
+     * prompt for index 0.  We must always report this synthetic row as a
+     * match, otherwise rofi filters it out when the search bar is non-empty
+     * and the prompt disappears from view.
+     */
+    if (pd->awaiting_touch)
+        return 1;
+
     if (index >= pd->entry_count)
         return 0;
     return helper_token_match(tokens, pd->entries[index].name);
