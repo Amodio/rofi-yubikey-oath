@@ -976,7 +976,25 @@ myplugin_token_match(const Mode *sw, rofi_int_matcher **tokens,
 
     if (index >= pd->entry_count)
         return 0;
-    return helper_token_match(tokens, pd->entries[index].name);
+
+    /*
+     * Match against the issuer (account name) only — the part before the
+     * colon in "Issuer:login".  If there is no colon, fall back to the
+     * full raw name.
+     */
+    const char *name  = pd->entries[index].name;
+    const char *colon = strchr(name, ':');
+    if (colon)
+    {
+        char issuer[ENTRY_NAME_MAX];
+        size_t issuer_len = (size_t)(colon - name);
+        if (issuer_len >= ENTRY_NAME_MAX)
+            issuer_len = ENTRY_NAME_MAX - 1;
+        memcpy(issuer, name, issuer_len);
+        issuer[issuer_len] = '\0';
+        return helper_token_match(tokens, issuer);
+    }
+    return helper_token_match(tokens, name);
 }
 
 /* ── Mode descriptor ────────────────────────────────────────────────────── */
